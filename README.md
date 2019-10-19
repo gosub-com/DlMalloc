@@ -3,7 +3,7 @@
 This is a port of [DlMalloc by Doug Lea](http://gee.cs.oswego.edu/dl/html/malloc.html)
 into C#.
 
-The original source code is here, [dlmalloc.c](dlmalloc.c), and the result of the
+The original source code is here, [dlmalloc.c](dlmalloc.c.original.txt), and the result of the
 port is here: [DlMallocBase.cs](DlMalloc/DlMallocBase.cs).  This base class is used
 to create two allocators, a memory alloctor and an array segment allocator.
 
@@ -53,7 +53,7 @@ it all in a `DlMallocThreadSafe` class.
 DlMalloc C# will run on either 32 bit or 64 bit systems by detecting the
 pointer size at runtime.
 
-## Port info
+## Port Info
 
 I stripped out a lot of unused functionality.  `CALL_MORECORE` (a pass through
 to sbrk) is gone and replaced by just `CALL_MMAP` and `CALL_MUNMAP` which has
