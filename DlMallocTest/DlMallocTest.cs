@@ -36,6 +36,8 @@ namespace Gosub.DlMallocTest
         Dictionary<long, ArraySegment<byte>> mAllocatedSegments = new Dictionary<long, ArraySegment<byte>>();
         DlMallocSegment mMallocSeg;
         ulong mAllocatedBytes;
+        ulong mAllocs;
+        ulong mFrees;
 
         public class UnitTestFailException : Exception
         {
@@ -66,14 +68,43 @@ namespace Gosub.DlMallocTest
             Console.WriteLine("Testing array segment allocator");
             ResetMalloc();
             SegRigorousAllocAndFree();
-            if (mAllocatedSegments.Count < 7000)
-                throw new UnitTestFailException("Expecting at least 7000 memory allocations");
+            if (mAllocatedSegments.Count < 14000)
+                throw new UnitTestFailException("Expecting at least 14000 memory allocations");
             if (mMallocSeg.SegmentCount == 0)
                 throw new UnitTestFailException("Expecting some segments to be allocated");
             // NOTE: Malloc trimmed old small segments, so there's a lot fewer than 12
             if (mMallocSeg.SegmentCount > 12)
                 throw new UnitTestFailException("Expecting fewer allocations with exponential growth");
+
+            // Check, delete 1/2
+            var heapSize = SegCheckHeapAndShowStats().HeapSize;
+            SegDeleteHalf();         
+            var usedBytes = SegCheckHeapAndShowStats().UsedBytes;
+
+            // Fill memory
+            Console.WriteLine("Fill heap without expanding...");
+            const double FRAGMENT_RATIO = 0.75;
+            var fbSeg = (long)((heapSize - usedBytes)*FRAGMENT_RATIO); 
+            while (fbSeg > 0)
+            {
+                int s = Rnd(2048);
+                fbSeg -= s;
+                SegMalloc(s);
+            }
+
+            // Delete and check
+            SegCheckHeapAndShowStats();
+            SegDeleteHalf();
+            SegCheckHeapAndShowStats();
+            SegDeleteHalf();
+            SegCheckHeapAndShowStats();
+            SegDeleteHalf();
+            SegCheckHeapAndShowStats();
+            SegDeleteHalf();
+            SegCheckHeapAndShowStats();
             SegDeleteAll();
+            SegCheckHeapAndShowStats();
+
             if (mAllocatedBytes != 0 || mAllocatedSegments.Count != 0)
                 throw new UnitTestFailException("All memory should be deallocated here");
 
@@ -81,17 +112,45 @@ namespace Gosub.DlMallocTest
             Console.WriteLine("Testing normal heap growth");
             ResetMalloc();
             MemRigorousAllocAndFree();
-            if (mAllocatedMem.Count < 7000)
-                throw new UnitTestFailException("Expecting at least 7000 memory allocations");
+            if (mAllocatedMem.Count < 14000)
+                throw new UnitTestFailException("Expecting at least 14000 memory allocations");
             var segmentsWithReleaseCore = mMallocMem.SegmentCount;
             if (segmentsWithReleaseCore == 0)
                 throw new UnitTestFailException("Expecting some segments to be allocated");
             // NOTE: Malloc trimmed old small segments, so there's a lot fewer than 12
             if (segmentsWithReleaseCore > 12)
                 throw new UnitTestFailException("Expecting fewer allocations with exponential growth");
+
+            // Check, delete 1/2
+            MemCheckHeapAndShowStats();
+            MemDeleteHalf();
+            MemCheckHeapAndShowStats();
+            MemDeleteHalf();
+            MemCheckHeapAndShowStats();
             MemDeleteAll();
+            var fbMem = MemCheckHeapAndShowStats().HeapSize;
             if (mAllocatedBytes != 0 || mAllocatedMem.Count != 0)
                 throw new UnitTestFailException("All memory should be deallocated here");
+
+
+            // Fill memory
+            Console.WriteLine("Fill heap without expanding...");
+            fbMem = (long)(fbMem * FRAGMENT_RATIO);
+            while (fbMem > 0)
+            {
+                int s = Rnd(2048);
+                fbMem -= s;
+                MemMalloc(s);
+            }
+
+            // Delete and check
+            MemCheckHeapAndShowStats();
+            MemDeleteHalf();
+            MemCheckHeapAndShowStats();
+            MemDeleteHalf();
+            MemCheckHeapAndShowStats();
+            MemDeleteAll();
+            MemCheckHeapAndShowStats();
 
             // Test normal exponential heap growth with failure to ever free memory
             Console.WriteLine("Testing ForceFailReleaseCore=true");
@@ -139,6 +198,29 @@ namespace Gosub.DlMallocTest
                 throw new UnitTestFailException("Malloc should be coelescing pages");
         }
 
+        private DlMallocBase.HeapStats SegCheckHeapAndShowStats()
+        {
+            var stats = mMallocSeg.CheckHeap();
+            Console.WriteLine(stats.ToString() + ", Allocs=" + mAllocs + ", Frees=" + mFrees);
+
+            if (Math.Abs(mAllocatedSegments.Count - stats.UsedChunks) > 2)
+                throw new UnitTestFailException("Allocated chunks does not match expected value");
+
+            return stats;
+        }
+
+        private DlMallocBase.HeapStats MemCheckHeapAndShowStats()
+        {
+            var stats = mMallocMem.CheckHeap();
+            Console.WriteLine(stats.ToString() + ", Allocs=" + mAllocs + ", Frees=" + mFrees);
+
+            if (Math.Abs(mAllocatedMem.Count - stats.UsedChunks) > 2)
+                throw new UnitTestFailException("Allocated chunks does not match expected value");
+
+            return stats;
+        }
+
+
         void ResetMalloc()
         {
             if (mMallocMem != null)
@@ -150,7 +232,10 @@ namespace Gosub.DlMallocTest
                 mMallocSeg.Dispose();
             mMallocSeg = new DlMallocSegment();
             mAllocatedSegments.Clear();
+
             mAllocatedBytes = 0;
+            mAllocs = 0;
+            mFrees = 0;
         }
 
         private void TestUnitTest()
@@ -201,11 +286,12 @@ namespace Gosub.DlMallocTest
         /// </summary>
         private void MemAllocBlocks(int min, int max, int step, bool deleteHalf = true)
         {
+            int count = 0;
             for (int size = min; size < max; size += step)
             {
                 MemMalloc(size);
-                if ((size % 2) != 0)
-                    MemDeleteRandom(size + min + max + step);
+                if (deleteHalf && (count++ & 1) != 0)
+                    MemDeleteRandom();
             }
         }
 
@@ -216,16 +302,31 @@ namespace Gosub.DlMallocTest
         {
             int count = mAllocatedMem.Count / 2;
             while (--count > 0)
-                MemDeleteRandom(count);
+                MemDeleteRandom();
+        }
+
+        static uint sRandomSeed;
+        static int Rnd(int max)
+        {
+            if (max <= 0)
+                return 0;
+            // Walk through 4 billion possibilities
+            sRandomSeed = sRandomSeed * 214013 + 2531011; // Walk through all 2^32 numbers
+            //return (int)(sRandomSeed * (1 / 4294967296.0) * max);
+            return (int)(sRandomSeed % 4294004207 % max);
         }
 
         /// <summary>
         /// Pseudo randomly delete an allocation
         /// </summary>
-        private void MemDeleteRandom(int randomSeed)
+        private void MemDeleteRandom()
         {
-            // Delete a pseudo randomly generated allocation            
-            var d = (randomSeed * 13 + (randomSeed >> 3) + (randomSeed >> 7)) % mAllocatedMem.Count;
+            if (mAllocatedMem.Count == 0)
+                return;
+
+
+            // Delete a pseudo randomly generated allocation
+            int d = Rnd(mAllocatedMem.Count);
             foreach (var kv in mAllocatedMem)
             {
                 if (d-- == 0)
@@ -256,6 +357,7 @@ namespace Gosub.DlMallocTest
             mAllocatedMem[(long)address] = length;
             SetMem(address, length);
             mAllocatedBytes += (ulong)length;
+            mAllocs++;
             return address;
         }
 
@@ -272,6 +374,7 @@ namespace Gosub.DlMallocTest
             ClearMem(mem, length);
             mMallocMem.Free(mem);
             mAllocatedBytes -= (ulong)length;
+            mFrees++;
         }
 
         // ----------------------------- SEGMENT TEST -----------------------
@@ -304,11 +407,12 @@ namespace Gosub.DlMallocTest
         /// </summary>
         private void SegAllocBlocks(int min, int max, int step, bool deleteHalf = true)
         {
+            int count = 0;
             for (int size = min; size < max; size += step)
             {
                 SegMalloc(size);
-                if ((size % 2) != 0)
-                    SegDeleteRandom(size + min + max + step);
+                if (deleteHalf && (count++ & 1) != 0)
+                    SegDeleteRandom();
             }
         }
 
@@ -319,16 +423,16 @@ namespace Gosub.DlMallocTest
         {
             int count = mAllocatedSegments.Count / 2;
             while (--count > 0)
-                SegDeleteRandom(count);
+                SegDeleteRandom();
         }
 
         /// <summary>
         /// Pseudo randomly delete an allocation
         /// </summary>
-        private void SegDeleteRandom(int randomSeed)
+        private void SegDeleteRandom()
         {
             // Delete a pseudo randomly generated allocation            
-            var d = (randomSeed * 13 + (randomSeed >> 3) + (randomSeed >> 7)) % mAllocatedSegments.Count;
+            int d = Rnd(mAllocatedSegments.Count);
             foreach (var kv in mAllocatedSegments)
             {
                 if (d-- == 0)
@@ -370,6 +474,7 @@ namespace Gosub.DlMallocTest
                 throw new UnitTestFailException("Unit test failed, expecting array segment to be set");
             }
             mAllocatedBytes += (ulong)length;
+            mAllocs++;
             return seg;
         }
 
@@ -401,8 +506,10 @@ namespace Gosub.DlMallocTest
             {
                 throw new UnitTestFailException("Unit test failed, expecting array segment to be cleared");
             }
+
             mMallocSeg.Free(seg);
             mAllocatedBytes -= (ulong)seg.Count;
+            mFrees++;
         }
 
         // ----------------------------- MISC MEM ---------------------------

@@ -544,14 +544,10 @@ namespace Gosub.DlMalloc
         static void set_foot(mchunk* p, size_t s) => ((mchunk*)((byte*)p + s))->prev_foot = s;
         static void set_size_and_pinuse_of_free_chunk(mchunk* p, size_t s) { p->head = s | PINUSE_BIT; set_foot(p, s); }
         static void set_free_with_pinuse(mchunk* p, size_t s, mchunk* n) { clear_pinuse(n); set_size_and_pinuse_of_free_chunk(p, s); }
-        static size_t overhead_for(mchunk* p) => is_mmapped(p) ? MMAP_CHUNK_OVERHEAD : CHUNK_OVERHEAD;
 
         // ------------------- Chunks sizes and alignments -----------------------
 
         static size_t CHUNK_OVERHEAD => SIZE_T_SIZE;
-        static size_t MMAP_CHUNK_OVERHEAD => TWO_SIZE_T_SIZES;
-        static size_t MMAP_FOOT_PAD => FOUR_SIZE_T_SIZES;
-
         static size_t MCHUNK_SIZE => (size_t)sizeof(mchunk);
         static size_t MIN_CHUNK_SIZE => (MCHUNK_SIZE + CHUNK_ALIGN_MASK) & ~CHUNK_ALIGN_MASK;
         static size_t MAX_REQUEST => unchecked((size_t)(-(int)MIN_CHUNK_SIZE) << 2);
@@ -875,8 +871,6 @@ namespace Gosub.DlMalloc
         [Conditional("DEBUG")] void check_free_chunk(mchunk* p) { do_check_free_chunk(p); }
         [Conditional("DEBUG")] void check_inuse_chunk(mchunk* p) { do_check_inuse_chunk(p); }
         [Conditional("DEBUG")] void check_malloced_chunk(void* mem, size_t s) { do_check_malloced_chunk(mem, s); }
-        [Conditional("DEBUG")] void check_mmapped_chunk(mchunk* p) { do_check_mmapped_chunk(p); }
-        [Conditional("DEBUG")] void check_malloc_state() { do_check_malloc_state(); }
         [Conditional("DEBUG")] void check_top_chunk(mchunk* p) { do_check_top_chunk(p); }
 
         // ---------------------------- Indexing Bins ----------------------------
@@ -914,7 +908,7 @@ namespace Gosub.DlMalloc
 
         // Shift placing maximum resolved bit in a treebin at i as sign bit
         static int leftshift_for_tree_index(size_t i)
-            => (int)(i == NTREEBINS - 1 ? 0 : SIZE_T_BITSIZE - SIZE_T_ONE - (i >> 1) + TREEBIN_SHIFT - 2);
+            => (int)(i == NTREEBINS - 1 ? 0 : SIZE_T_BITSIZE - SIZE_T_ONE - ((i >> 1) + TREEBIN_SHIFT - 2));
 
         // The size of the smallest chunk held in bin with index i
         static size_t minsize_for_tree_index(size_t i)
@@ -1054,7 +1048,7 @@ namespace Gosub.DlMalloc
 
         static void assert(bool c)
         {
-            System.Diagnostics.Debug.Assert(c);
+            if (!c) throw new DlMallocException("Malloc assert failed");
         }
 
         // Check properties of any chunk, whether free, inuse, mmapped etc 
@@ -1079,21 +1073,6 @@ namespace Gosub.DlMalloc
             assert(!pinuse(chunk_plus_offset(p, sz)));
         }
 
-        // Check properties of (inuse) mmapped chunks
-        void do_check_mmapped_chunk(mchunk* p)
-        {
-            size_t sz = chunksize(p);
-            size_t len = (sz + (p->prev_foot) + MMAP_FOOT_PAD);
-            assert(is_mmapped(p));
-            assert(use_mmap());
-            assert((is_aligned(chunk2mem(p))) || (p->head == FENCEPOST_HEAD));
-            assert(ok_address(p));
-            assert(!is_small(sz));
-            assert((len & (mparams.page_size - SIZE_T_ONE)) == 0);
-            assert(chunk_plus_offset(p, sz)->head == FENCEPOST_HEAD);
-            assert(chunk_plus_offset(p, sz + SIZE_T_SIZE)->head == 0);
-        }
-
         // Check properties of inuse chunks
         void do_check_inuse_chunk(mchunk* p)
         {
@@ -1101,9 +1080,8 @@ namespace Gosub.DlMalloc
             assert(is_inuse(p));
             assert(next_pinuse(p));
             // If not pinuse and not mmapped, previous chunk has OK offset
-            assert(is_mmapped(p) || pinuse(p) || next_chunk(prev_chunk(p)) == p);
-            if (is_mmapped(p))
-                do_check_mmapped_chunk(p);
+            assert(pinuse(p) || next_chunk(prev_chunk(p)) == p);
+            assert(!is_mmapped(p));
         }
 
         // Check properties of free chunks
@@ -1144,7 +1122,8 @@ namespace Gosub.DlMalloc
                 assert(sz >= MIN_CHUNK_SIZE);
                 assert(sz >= s);
                 /* unless mmapped, size is less than MIN_CHUNK_SIZE more than request */
-                assert(is_mmapped(p) || sz < (s + MIN_CHUNK_SIZE));
+                assert(!is_mmapped(p));
+                assert(sz < (s + MIN_CHUNK_SIZE));
             }
         }
 
@@ -1289,52 +1268,30 @@ namespace Gosub.DlMalloc
             return false;
         }
 
-        // Traverse each chunk and check it; return total
-        size_t traverse_and_check()
+        public class HeapStats
         {
-            size_t sum = 0;
-            if (is_initialized())
+            public long HeapSize;
+            public long UsedChunks;
+            public long UsedBytes;
+            public long FreeChunks;
+            public long FreeBytes;
+
+            public override string ToString()
             {
-                msegment* s = seg;
-                sum += topsize + TOP_FOOT_SIZE;
-                while (s != null)
-                {
-                    mchunk* q = align_as_chunk(s->baseAddr);
-                    mchunk* lastq = null;
-                    assert(pinuse(q));
-                    while (segment_holds(s, q) &&
-                           q != top && q->head != FENCEPOST_HEAD)
-                    {
-                        sum += chunksize(q);
-                        if (is_inuse(q))
-                        {
-                            assert(!bin_find(q));
-                            do_check_inuse_chunk(q);
-                        }
-                        else
-                        {
-                            assert(q == dv || bin_find(q));
-                            assert(lastq == null || is_inuse(lastq)); /* Not 2 consecutive free */
-                            do_check_free_chunk(q);
-                        }
-                        lastq = q;
-                        q = next_chunk(q);
-                    }
-                    s = s->next;
-                }
+                return "HeapSize=" + HeapSize + ", UB=" + UsedBytes + ", FB=" + FreeBytes
+                    + ", UC=" + UsedChunks + ", FC=" + FreeChunks;
             }
-            return sum;
         }
 
         // Check all properties of malloc_state.
-        void do_check_malloc_state()
+        public HeapStats CheckHeap()
         {
-            uint i;
-            size_t total;
+            assert(is_initialized());
+
             // check bins
-            for (i = 0; i < NSMALLBINS; ++i)
+            for (uint i = 0; i < NSMALLBINS; ++i)
                 do_check_smallbin(i);
-            for (i = 0; i < NTREEBINS; ++i)
+            for (uint i = 0; i < NTREEBINS; ++i)
                 do_check_treebin(i);
 
             if (dvsize != 0)
@@ -1354,10 +1311,61 @@ namespace Gosub.DlMalloc
                 assert(!bin_find(top));
             }
 
-            total = traverse_and_check();
-            assert(total <= footprint);
+            int usedChunks = 0;
+            int freeChunks = 0;
+            long freeBytes = 0;
+            long usedBytes = 0;
+            long heapSize = 0;
+            heapSize += (long)(topsize + TOP_FOOT_SIZE);
+
+            // Walk segments
+            msegment* s = seg;
+            while (s != null)
+            {
+                mchunk* q = align_as_chunk(s->baseAddr);
+                mchunk* lastq = null;
+                assert(pinuse(q));
+
+                // Walk chunks
+                while (segment_holds(s, q) 
+                        && q != top && q->head != FENCEPOST_HEAD)
+                {
+                    var chunkSize = (long)chunksize(q);
+                    heapSize += chunkSize;
+                    if (is_inuse(q))
+                    {
+                        usedBytes += chunkSize;
+                        usedChunks += 1;
+                        assert(!bin_find(q));
+                        do_check_inuse_chunk(q);
+                    }
+                    else
+                    {
+                        freeBytes += chunkSize;
+                        freeChunks += 1;
+                        assert(q == dv || bin_find(q));
+                        assert(lastq == null || is_inuse(lastq)); /* Not 2 consecutive free */
+                        do_check_free_chunk(q);
+                    }
+                    lastq = q;
+                    q = next_chunk(q);
+                }
+                s = s->next;
+            }
+
+
+            assert(heapSize <= (long)footprint);
             assert(footprint <= max_footprint);
+
+            var stats = new HeapStats();
+            stats.HeapSize = heapSize;
+            stats.FreeChunks = freeChunks;
+            stats.FreeBytes = freeBytes;
+            stats.UsedChunks = usedChunks;
+            stats.UsedBytes = usedBytes;
+            return stats;
         }
+
 
         // ----------------------- Operations on smallbins -----------------------
 
@@ -2017,13 +2025,6 @@ namespace Gosub.DlMalloc
             {
                 mchunk* prev;
                 size_t prevsize = p->prev_foot;
-                if (is_mmapped(p))
-                {
-                    psize += prevsize + MMAP_FOOT_PAD;
-                    if (CallReleaseCore((byte*)p - prevsize, psize))
-                        footprint -= psize;
-                    return;
-                }
                 prev = chunk_minus_offset(p, prevsize);
                 psize += prevsize;
                 p = prev;
@@ -2539,44 +2540,35 @@ namespace Gosub.DlMalloc
                 CallUsageErrorAction(p);
                 return;
             }
+            assert(!is_mmapped(p));
+
 
             size_t psize = chunksize(p);
             mchunk* next = chunk_plus_offset(p, psize);
             if (!pinuse(p))
             {
                 size_t prevsize = p->prev_foot;
-                if (is_mmapped(p))
+                mchunk* prev = chunk_minus_offset(p, prevsize);
+                psize += prevsize;
+                p = prev;
+                if (RTCHECK(ok_address(prev)))
                 {
-                    // NOTE: Direct MMAP was removed, so this never gets called
-                    psize += prevsize + MMAP_FOOT_PAD;
-                    if (CallReleaseCore((byte*)p - prevsize, psize))
-                        footprint -= psize;
-                    return;
+                    // consolidate backward
+                    if (p != dv)
+                    {
+                        unlink_chunk(p, prevsize);
+                    }
+                    else if ((next->head & INUSE_BITS) == INUSE_BITS)
+                    {
+                        dvsize = psize;
+                        set_free_with_pinuse(p, psize, next);
+                        return;
+                    }
                 }
                 else
                 {
-                    mchunk* prev = chunk_minus_offset(p, prevsize);
-                    psize += prevsize;
-                    p = prev;
-                    if (RTCHECK(ok_address(prev)))
-                    {
-                        // consolidate backward
-                        if (p != dv)
-                        {
-                            unlink_chunk(p, prevsize);
-                        }
-                        else if ((next->head & INUSE_BITS) == INUSE_BITS)
-                        {
-                            dvsize = psize;
-                            set_free_with_pinuse(p, psize, next);
-                            return;
-                        }
-                    }
-                    else
-                    {
-                        CallUsageErrorAction(p);
-                        return;
-                    }
+                    CallUsageErrorAction(p);
+                    return;
                 }
             }
 

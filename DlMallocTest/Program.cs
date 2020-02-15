@@ -39,10 +39,12 @@ namespace Gosub.DlMallocTest
     {
         unsafe static void Main(string[] args)
         {
+            var time = DateTime.Now;
             var test = new DlMallocTest();
             test.Test();
             MemoryExample();
             SegmentExample();
+            Console.WriteLine("Time = " + (DateTime.Now-time));
             Console.WriteLine("Press ENTER to exit");
             Console.ReadLine();
         }
