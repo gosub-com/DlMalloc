@@ -209,7 +209,6 @@ namespace Gosub.DlMalloc
         tchunk** treebins;
         size_t footprint;
         size_t max_footprint;
-        flag_t mflags;
         msegment* seg;
         int malloc_corruption_error_count;
 
@@ -769,19 +768,7 @@ namespace Gosub.DlMalloc
             public byte* baseAddr;   // base address
             public size_t size;       // allocated size
             public msegment* next;       // ptr to next segment
-            public flag_t sflags;     // mmap and extern flag
         };
-
-        static bool is_mmapped_segment(msegment* s) => (s->sflags & flag_t.USE_MMAP_BIT) != 0;
-        static bool is_extern_segment(msegment* s) => ((s)->sflags & flag_t.EXTERN_BIT) != 0;
-
-        // Everything is mmaped in this malloc, so these flags are mostly unused
-        enum flag_t
-        {
-            USE_MMAP_BIT = 1,
-            EXTERN_BIT = 8,
-        }
-
 
         //  malloc_params holds global properties, including those that can be
         //  dynamically set using mallopt. There is a single instance, mparams,
@@ -794,7 +781,6 @@ namespace Gosub.DlMalloc
             public size_t page_size;
             public size_t granularity;
             public size_t trim_threshold;
-            public flag_t default_mflags;
         };
 
         malloc_params mparams;
@@ -807,9 +793,6 @@ namespace Gosub.DlMalloc
         // -------------------------- system alloc setup -------------------------
 
         // Operations on mflags
-
-        bool use_mmap() => (mflags & flag_t.USE_MMAP_BIT) != 0;
-        void enable_mmap() => mflags |= flag_t.USE_MMAP_BIT;
 
         // page-align a size 
         size_t page_align(size_t s)
@@ -1034,7 +1017,6 @@ namespace Gosub.DlMalloc
                 mparams.granularity = gsize;
                 mparams.page_size = psize;
                 mparams.trim_threshold = DEFAULT_TRIM_THRESHOLD;
-                mparams.default_mflags = flag_t.USE_MMAP_BIT;
 
                 size_t magic = (size_t)(Environment.TickCount + DateTime.Now.Ticks + 0x55555555U);
                 magic |= 8U;    // ensure nonzero
@@ -1751,7 +1733,7 @@ namespace Gosub.DlMalloc
         }
 
         // Add a segment to hold a new noncontiguous region
-        void add_segment(byte* tbase, size_t tsize, flag_t mmapped)
+        void add_segment(byte* tbase, size_t tsize)
         {
             // Determine locations and sizes of segment, fenceposts, old top
             byte* old_top = (byte*)top;
@@ -1777,7 +1759,6 @@ namespace Gosub.DlMalloc
             *ss = *seg; // Push current record
             seg->baseAddr = tbase;
             seg->size = tsize;
-            seg->sflags = mmapped;
             seg->next = ss;
 
             // Insert trailing fenceposts
@@ -1813,7 +1794,6 @@ namespace Gosub.DlMalloc
         {
             byte* tbase = null;
             size_t tsize = 0;
-            flag_t mmap_flag = 0;
             size_t asize; // allocation size
 
             ensure_initialization();
@@ -1836,7 +1816,6 @@ namespace Gosub.DlMalloc
                 {
                     tbase = mp;
                     tsize = asize;
-                    mmap_flag = flag_t.USE_MMAP_BIT;
                 }
             }
 
@@ -1856,10 +1835,7 @@ namespace Gosub.DlMalloc
                 while (sp != null && tbase != sp->baseAddr + sp->size)
                     sp = NO_SEGMENT_TRAVERSAL ? null : sp->next;
 
-                if (sp != null &&
-                    !is_extern_segment(sp) &&
-                    (sp->sflags & flag_t.USE_MMAP_BIT) == mmap_flag &&
-                    segment_holds(sp, top))
+                if (sp != null && segment_holds(sp, top))
                 {
                     // append
                     sp->size += tsize;
@@ -1872,9 +1848,7 @@ namespace Gosub.DlMalloc
                     sp = seg;
                     while (sp != null && sp->baseAddr != tbase + tsize)
                         sp = (NO_SEGMENT_TRAVERSAL) ? null : sp->next;
-                    if (sp != null &&
-                        !is_extern_segment(sp) &&
-                        (sp->sflags & flag_t.USE_MMAP_BIT) == mmap_flag)
+                    if (sp != null)
                     {
                         byte* oldbase = sp->baseAddr;
                         sp->baseAddr = tbase;
@@ -1882,7 +1856,7 @@ namespace Gosub.DlMalloc
                         return prepend_alloc(tbase, oldbase, nb);
                     }
                     else
-                        add_segment(tbase, tsize, mmap_flag);
+                        add_segment(tbase, tsize);
                 }
 
                 if (nb < topsize)
@@ -1919,38 +1893,36 @@ namespace Gosub.DlMalloc
                 size_t size = sp->size;
                 msegment* next = sp->next;
                 ++nsegs;
-                if (is_mmapped_segment(sp) && !is_extern_segment(sp))
+                mchunk* p = align_as_chunk(baseAddr);
+                size_t psize = chunksize(p);
+                // Can unmap if first chunk holds entire segment and not pinned
+                if (!is_inuse(p) && (byte*)p + psize >= baseAddr + size - TOP_FOOT_SIZE)
                 {
-                    mchunk* p = align_as_chunk(baseAddr);
-                    size_t psize = chunksize(p);
-                    // Can unmap if first chunk holds entire segment and not pinned
-                    if (!is_inuse(p) && (byte*)p + psize >= baseAddr + size - TOP_FOOT_SIZE)
+                    tchunk* tp = (tchunk*)p;
+                    assert(segment_holds(sp, (byte*)sp));
+                    if (p == dv)
                     {
-                        tchunk* tp = (tchunk*)p;
-                        assert(segment_holds(sp, (byte*)sp));
-                        if (p == dv)
-                        {
-                            dv = null;
-                            dvsize = 0;
-                        }
-                        else
-                        {
-                            unlink_large_chunk(tp);
-                        }
-                        if (CallReleaseCore(baseAddr, size))
-                        {
-                            released += size;
-                            footprint -= size;
-                            // unlink obsoleted record
-                            sp = pred;
-                            sp->next = next;
-                        }
-                        else
-                        { // back out if cannot unmap
-                            insert_large_chunk(tp, psize);
-                        }
+                        dv = null;
+                        dvsize = 0;
+                    }
+                    else
+                    {
+                        unlink_large_chunk(tp);
+                    }
+                    if (CallReleaseCore(baseAddr, size))
+                    {
+                        released += size;
+                        footprint -= size;
+                        // unlink obsoleted record
+                        sp = pred;
+                        sp->next = next;
+                    }
+                    else
+                    { // back out if cannot unmap
+                        insert_large_chunk(tp, psize);
                     }
                 }
+                
                 if (NO_SEGMENT_TRAVERSAL) // scan only first segment
                     break;
                 pred = sp;
@@ -1978,21 +1950,15 @@ namespace Gosub.DlMalloc
                                     SIZE_T_ONE) * unit;
                     msegment* sp = segment_holding((byte*)top);
 
-                    if (!is_extern_segment(sp))
+                    if (sp->size >= extra &&
+                        !has_segment_link(sp))
                     {
-                        if (is_mmapped_segment(sp))
-                        {
-                            if (sp->size >= extra &&
-                                !has_segment_link(sp))
-                            {
-                                // can't shrink if pinned
-                                size_t newsize = sp->size - extra;
+                        // can't shrink if pinned
+                        size_t newsize = sp->size - extra;
 
-                                if (CallReleaseCore(sp->baseAddr + newsize, extra))
-                                {
-                                    released = extra;
-                                }
-                            }
+                        if (CallReleaseCore(sp->baseAddr + newsize, extra))
+                        {
+                            released = extra;
                         }
                     }
 
@@ -2304,7 +2270,6 @@ namespace Gosub.DlMalloc
             seg->size = footprint = max_footprint = tsize;
             magic = mparams.magic;
             release_checks = MAX_RELEASE_CHECK_RATE;
-            mflags = mparams.default_mflags;
 
             init_bins();
             mn = next_chunk(mem2chunk(m));
@@ -2329,7 +2294,6 @@ namespace Gosub.DlMalloc
             if (tbase != null)
             {
                 init_user_mstate(tbase, tsize);
-                seg->sflags = flag_t.USE_MMAP_BIT;
             }
             else
             {
@@ -2348,10 +2312,8 @@ namespace Gosub.DlMalloc
             {
                 byte* baseAddr = sp->baseAddr;
                 size_t size = sp->size;
-                flag_t flag = sp->sflags;
                 sp = sp->next;
-                if ((flag & flag_t.USE_MMAP_BIT) != 0 && (flag & flag_t.EXTERN_BIT) == 0 &&
-                    CallReleaseCore(baseAddr, size))
+                if (CallReleaseCore(baseAddr, size))
                 {
                     //freed += size;
                 }
